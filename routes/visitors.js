@@ -252,24 +252,23 @@ router.get('/streaks', async (req, res) => {
 
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
 
-    const top = await Visitor.find({ currentStreak: { $gte: 1 } })
+    // Only streaks still alive (visited today or yesterday) — filter BEFORE sorting and
+    // limiting. Filtering afterwards left the top-5 empty whenever the biggest stored
+    // streaks were old ones, and gave ranks like "44" to the people who remained.
+    const top = await Visitor.find({ currentStreak: { $gte: 1 }, lastStreakDate: { $in: [today, yesterdayStr] } })
       .sort({ currentStreak: -1, longestStreak: -1 })
       .limit(limit)
       .select('visitorName registeredName registeredPhoto currentStreak longestStreak lastStreakDate isRegistered');
 
-    const leaderboard = top.map((v, i) => {
-      // If last streak date is not today or yesterday, the streak is stale
-      const isActive = v.lastStreakDate === today || v.lastStreakDate === yesterdayStr;
-      return {
-        rank: i + 1,
-        name: v.isRegistered ? v.registeredName : v.visitorName,
-        photo: v.registeredPhoto || null,
-        currentStreak: isActive ? v.currentStreak : 0,
-        longestStreak: v.longestStreak,
-        isActive,
-        isRegistered: v.isRegistered
-      };
-    }).filter(v => v.currentStreak > 0);
+    const leaderboard = top.map((v, i) => ({
+      rank: i + 1,
+      name: (v.isRegistered && v.registeredName) || v.visitorName,
+      photo: v.registeredPhoto || null,
+      currentStreak: v.currentStreak,
+      longestStreak: v.longestStreak,
+      isActive: true,
+      isRegistered: v.isRegistered,
+    }));
 
     res.json({ success: true, leaderboard });
   } catch (err) {
@@ -492,176 +491,138 @@ router.get('/me', async (req, res) => {
 });
 
 // GET - Nearby visitors using saved visitor profile name and current location name
+// ── Nearby ──────────────────────────────────────────────────────
+// Nearest opted-in people first, within a radius, using the 2dsphere index.
+// Privacy: no coordinates or map links leave the server, distances are rounded to
+// 0.5 km, and only people who share their own location may see the list.
+const NEARBY_FIELDS = 'visitorName registeredName registeredPhone registeredPhoto registeredProfession registeredArea locationName locationUpdatedAt currentStreak isRegistered linkedAndroidDeviceId latitude longitude';
+const validCoords = (lat, lng) => Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180 && !(lat === 0 && lng === 0);
+const roundKm = d => Math.max(0.5, Math.round(d * 2) / 2);
+const kmLabel = d => (d < 1 ? '1 km से कम' : `${d % 1 ? d.toFixed(1) : d} km`);
+
+// Older documents only have latitude/longitude; give them the GeoJSON point once.
+let geoBackfill = null;
+function ensureGeoBackfill() {
+  if (!geoBackfill) {
+    geoBackfill = Visitor.updateMany(
+      { latitude: { $gte: -90, $lte: 90 }, longitude: { $gte: -180, $lte: 180 }, 'geo.coordinates': { $exists: false } },
+      [{ $set: { geo: { type: 'Point', coordinates: ['$longitude', '$latitude'] } } }]
+    ).catch(err => { console.error('[Nearby] geo backfill failed:', err.message); geoBackfill = null; });
+  }
+  return geoBackfill;
+}
+
+// Google Maps link to the person's area: coordinates rounded to 2 decimals (~1 km),
+// enough to find the neighbourhood without pinpointing anyone's house.
+function approxMapUrl(lat, lng) {
+  if (!validCoords(lat, lng)) return '';
+  return `https://www.google.com/maps/search/?api=1&query=${lat.toFixed(2)},${lng.toFixed(2)}`;
+}
+
+function nearbyEntry(v, distanceKm, override = {}) {
+  const d = distanceKm == null ? null : roundKm(distanceKm);
+  const lat = override.lat ?? v.latitude, lng = override.lng ?? v.longitude;
+  return {
+    name: (v.registeredName || v.visitorName || 'गाँव वाले').trim(),
+    phone: v.registeredPhone || '',
+    photo: v.registeredPhoto || '',
+    profession: v.registeredProfession || '',
+    area: v.registeredArea || '',                                   // mohalla from the profile
+    locationName: override.locationName || v.locationName || '',    // place of the latest shared location
+    mapUrl: approxMapUrl(lat, lng),
+    currentStreak: v.currentStreak || 0,
+    isRegistered: Boolean(v.isRegistered),
+    distanceKm: d,
+    distanceLabel: d == null ? '' : kmLabel(d),
+    updatedAt: override.updatedAt || v.locationUpdatedAt || null,
+  };
+}
+
+// GET /api/visitors/nearby?token=…&radius=50&limit=60
 router.get('/nearby', async (req, res) => {
   try {
     const visitorToken = req.headers['x-visitor-token'] || req.query.token;
     if (!visitorToken) return res.status(400).json({ message: 'Token required' });
 
-    const currentVisitor = await Visitor.findOne({ visitorToken })
-      .select('visitorName registeredName registeredPhone registeredPhoto registeredProfession registeredArea latitude longitude locationName locationUpdatedAt visitCount currentStreak');
-    if (!currentVisitor) return res.status(404).json({ message: 'Visitor not found' });
+    const me = await Visitor.findOne({ visitorToken })
+      .select('visitorName registeredName registeredPhone registeredPhoto registeredProfession registeredArea latitude longitude locationName locationUpdatedAt currentStreak nearbySharingEnabled city region country');
+    if (!me) return res.status(404).json({ message: 'Visitor not found' });
 
-    const currentName = (currentVisitor.registeredName || currentVisitor.visitorName || '').trim();
-    const currentPhone = (currentVisitor.registeredPhone || '').trim();
-    const profileComplete = Boolean(currentName && !/^user\d+$/i.test(currentName) && currentPhone);
+    const myName = (me.registeredName || me.visitorName || '').trim();
+    const myPhone = (me.registeredPhone || '').trim();
+    const profileComplete = Boolean(myName && !/^user\d+$/i.test(myName) && myPhone);
+    const currentVisitor = {
+      name: myName, phone: myPhone, profileComplete,
+      photo: me.registeredPhoto || '', profession: me.registeredProfession || '', area: me.registeredArea || '',
+      locationName: me.locationName || '', locationUpdatedAt: me.locationUpdatedAt || null,
+      sharing: Boolean(me.nearbySharingEnabled), currentStreak: me.currentStreak || 0,
+    };
+    // Reciprocity: the list is for people who share their own location too.
+    if (!profileComplete) return res.status(403).json({ message: 'पहले नाम और मोबाइल नंबर जोड़ें', needsProfile: true, currentVisitor });
+    if (!me.nearbySharingEnabled) return res.status(403).json({ message: 'आस-पास के लोग देखने के लिए अपनी लोकेशन साझा करें', needsSharing: true, currentVisitor });
 
-    // Only show users who explicitly opted in to nearby sharing
-    const others = await Visitor.find({
-      visitorToken: { $ne: visitorToken },
-      nearbySharingEnabled: true,
-      latitude: { $exists: true, $ne: null },
-      longitude: { $exists: true, $ne: null },
-    })
-      .select('visitorName registeredName registeredPhone registeredPhoto registeredProfession registeredArea latitude longitude locationName locationUpdatedAt visitCount currentStreak firstVisit city region country isRegistered linkedAndroidDeviceId')
-      .sort({ locationUpdatedAt: -1 })
-      .limit(200);
+    const radiusKm = Math.min(200, Math.max(1, Number(req.query.radius) || 50));
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 60));
+    const cutoff = new Date(Date.now() - 60 * 24 * 3600e3); // ignore locations older than 60 days
+    const hasCoords = validCoords(me.latitude, me.longitude);
+    const baseQuery = { _id: { $ne: me._id }, nearbySharingEnabled: true, locationUpdatedAt: { $gte: cutoff } };
 
-    // Batch-fetch linked android devices to use more recent location & profile
-    const linkedDeviceIds = others.map(v => v.linkedAndroidDeviceId).filter(Boolean);
-    const linkedDeviceMap = new Map();
-    if (linkedDeviceIds.length) {
-      const devices = await AndroidDevice.find({ _id: { $in: linkedDeviceIds } })
-        .select('_id latitude longitude locationName locationUpdatedAt')
-        .lean();
-      devices.forEach(d => linkedDeviceMap.set(String(d._id), d));
-    }
-
-    const hasCurrentCoords = Number.isFinite(currentVisitor.latitude) && Number.isFinite(currentVisitor.longitude);
-
-    const visitorEntries = others
-      .map((visitor) => {
-        // Prefer android device location if it's more recent
-        let lat = visitor.latitude;
-        let lng = visitor.longitude;
-        let locationName = visitor.locationName;
-        let locationUpdatedAt = visitor.locationUpdatedAt;
-        let isLinkedUser = false;
-
-        if (visitor.linkedAndroidDeviceId) {
-          const dev = linkedDeviceMap.get(String(visitor.linkedAndroidDeviceId));
-          if (dev && Number.isFinite(dev.latitude)) {
-            const devTime = dev.locationUpdatedAt ? new Date(dev.locationUpdatedAt).getTime() : 0;
-            const visTime = visitor.locationUpdatedAt ? new Date(visitor.locationUpdatedAt).getTime() : 0;
-            if (devTime > visTime) {
-              lat = dev.latitude;
-              lng = dev.longitude;
-              locationName = dev.locationName || locationName;
-              locationUpdatedAt = dev.locationUpdatedAt;
-            }
-            isLinkedUser = true;
-          }
+    let people = [];
+    if (hasCoords) {
+      await ensureGeoBackfill();
+      const rows = await Visitor.aggregate([
+        { $geoNear: {
+          near: { type: 'Point', coordinates: [me.longitude, me.latitude] },
+          key: 'geo', distanceField: 'distM', spherical: true, maxDistance: radiusKm * 1000, query: baseQuery,
+        } },
+        { $limit: limit },
+      ]);
+      // People also using the old Android app: their phone may have a fresher location.
+      const devIds = rows.map(v => v.linkedAndroidDeviceId).filter(Boolean);
+      const devs = devIds.length
+        ? new Map((await AndroidDevice.find({ _id: { $in: devIds } }).select('latitude longitude locationName locationUpdatedAt').lean()).map(d => [String(d._id), d]))
+        : new Map();
+      people = rows.map(v => {
+        const d = v.linkedAndroidDeviceId && devs.get(String(v.linkedAndroidDeviceId));
+        if (d && validCoords(d.latitude, d.longitude) && new Date(d.locationUpdatedAt || 0) > new Date(v.locationUpdatedAt || 0)) {
+          return nearbyEntry(v, haversineDistanceKm(me.latitude, me.longitude, d.latitude, d.longitude), { locationName: d.locationName, updatedAt: d.locationUpdatedAt, lat: d.latitude, lng: d.longitude });
         }
-
-        const distanceKm = hasCurrentCoords
-          ? haversineDistanceKm(currentVisitor.latitude, currentVisitor.longitude, lat, lng)
-          : null;
-
-        const displayName = (visitor.registeredName || visitor.visitorName || 'Hadlay user').trim();
-        return {
-          name: displayName,
-          phone: visitor.registeredPhone || '',
-          photo: visitor.registeredPhoto || '',
-          profession: visitor.registeredProfession || '',
-          area: visitor.registeredArea || '',
-          locationName: locationName || visitor.registeredArea || 'स्थान उपलब्ध नहीं',
-          latitude: lat,
-          longitude: lng,
-          mapUrl: `https://maps.google.com/?q=${lat},${lng}`,
-          city: visitor.city || '',
-          region: visitor.region || '',
-          country: visitor.country || '',
-          visitCount: visitor.visitCount || 0,
-          currentStreak: visitor.currentStreak || 0,
-          firstVisit: visitor.firstVisit || null,
-          isRegistered: Boolean(visitor.isRegistered),
-          isLinkedUser,
-          distanceKm: distanceKm != null ? Number(distanceKm.toFixed(1)) : null,
-          distanceLabel: distanceKm == null ? '' : (distanceKm < 1 ? '< 1 km' : `${distanceKm.toFixed(1)} km`),
-          updatedAt: locationUpdatedAt
-        };
-      })
-      .filter(Boolean);
-
-    // Also include Android-only users (not linked to any Visitor) who have shared their location
-    const unlinkedAndroidDevices = await AndroidDevice.find({
-      linkedVisitorId: null,
-      nearbySharingEnabled: true,
-      latitude: { $exists: true, $ne: null },
-      longitude: { $exists: true, $ne: null },
-    })
-      .select('registeredPhone brand model city region country latitude longitude locationName locationUpdatedAt lastSeen')
-      .lean();
-
-    const androidEntries = unlinkedAndroidDevices.map((device) => {
-      const distanceKm = hasCurrentCoords
-        ? haversineDistanceKm(currentVisitor.latitude, currentVisitor.longitude, device.latitude, device.longitude)
-        : null;
-      const displayName = device.registeredPhone
-        ? device.registeredPhone
-        : ((device.brand || '') + ' ' + (device.model || '')).trim() || 'App यूज़र';
-      return {
-        name: displayName,
-        phone: device.registeredPhone || '',
-        photo: '',
-        profession: '',
-        area: device.city || device.region || '',
-        locationName: device.locationName || device.city || 'स्थान उपलब्ध नहीं',
-        latitude: device.latitude,
-        longitude: device.longitude,
-        mapUrl: `https://maps.google.com/?q=${device.latitude},${device.longitude}`,
-        city: device.city || '',
-        region: device.region || '',
-        country: device.country || '',
-        visitCount: 0,
-        currentStreak: 0,
-        firstVisit: null,
-        isRegistered: false,
-        isLinkedUser: false,
-        isAppUser: true,
-        distanceKm: distanceKm != null ? Number(distanceKm.toFixed(1)) : null,
-        distanceLabel: distanceKm == null ? '' : (distanceKm < 1 ? '< 1 km' : `${distanceKm.toFixed(1)} km`),
-        updatedAt: device.locationUpdatedAt || device.lastSeen
-      };
-    });
-
-    const nearbyVisitors = [...visitorEntries, ...androidEntries]
-      .sort((a, b) => {
-        if (a.distanceKm == null && b.distanceKm == null) return 0;
-        if (a.distanceKm == null) return 1;
-        if (b.distanceKm == null) return -1;
-        return a.distanceKm - b.distanceKm;
+        return nearbyEntry(v, v.distM / 1000);
       });
 
-    if (currentVisitor._id && Number.isFinite(currentVisitor.latitude) && Number.isFinite(currentVisitor.longitude)) {
-      recordLocationVisit('Visitor', currentVisitor._id, {
-        latitude:     currentVisitor.latitude,
-        longitude:    currentVisitor.longitude,
-        locationName: currentVisitor.locationName || '',
-        city:         currentVisitor.city || '',
-        region:       currentVisitor.region || '',
-        country:      currentVisitor.country || '',
+      // Old-app-only users (no visitor profile): bounded box first, then exact distance.
+      const dLat = radiusKm / 111, dLng = radiusKm / (111 * Math.max(0.2, Math.cos(me.latitude * Math.PI / 180)));
+      const devices = await AndroidDevice.find({
+        linkedVisitorId: null, nearbySharingEnabled: true, locationUpdatedAt: { $gte: cutoff },
+        latitude: { $gte: me.latitude - dLat, $lte: me.latitude + dLat },
+        longitude: { $gte: me.longitude - dLng, $lte: me.longitude + dLng },
+      }).select('registeredPhone brand model city locationName latitude longitude locationUpdatedAt').limit(50).lean();
+      for (const dev of devices) {
+        const km = haversineDistanceKm(me.latitude, me.longitude, dev.latitude, dev.longitude);
+        if (km > radiusKm) continue;
+        const r = roundKm(km);
+        people.push({
+          name: dev.registeredPhone ? 'ऐप यूज़र' : (`${dev.brand || ''} ${dev.model || ''}`.trim() || 'ऐप यूज़र'),
+          phone: dev.registeredPhone || '', photo: '', profession: '', area: dev.city || '',
+          locationName: dev.locationName || dev.city || '', mapUrl: approxMapUrl(dev.latitude, dev.longitude),
+          currentStreak: 0, isRegistered: false, isAppUser: true,
+          distanceKm: r, distanceLabel: kmLabel(r), updatedAt: dev.locationUpdatedAt || null,
+        });
+      }
+      people.sort((a, b) => a.distanceKm - b.distanceKm);
+      people = people.slice(0, limit);
+
+      recordLocationVisit('Visitor', me._id, {
+        latitude: me.latitude, longitude: me.longitude, locationName: me.locationName || '',
+        city: me.city || '', region: me.region || '', country: me.country || '',
       }).catch(console.error);
+    } else {
+      // No usable location yet: most recently active sharers, without distances.
+      const rows = await Visitor.find(baseQuery).select(NEARBY_FIELDS).sort({ locationUpdatedAt: -1 }).limit(limit).lean();
+      people = rows.map(v => nearbyEntry(v, null));
     }
 
-    return res.json({
-      success: true,
-      canMeasureDistance: hasCurrentCoords,
-      currentVisitor: {
-        name: currentName,
-        phone: currentPhone,
-        profileComplete,
-        photo: currentVisitor.registeredPhoto || '',
-        profession: currentVisitor.registeredProfession || '',
-        area: currentVisitor.registeredArea || '',
-        locationName: currentVisitor.locationName || '',
-        latitude: currentVisitor.latitude || null,
-        longitude: currentVisitor.longitude || null,
-        locationUpdatedAt: currentVisitor.locationUpdatedAt || null,
-        visitCount: currentVisitor.visitCount || 0,
-        currentStreak: currentVisitor.currentStreak || 0
-      },
-      nearbyVisitors
-    });
+    res.json({ success: true, canMeasureDistance: hasCoords, radiusKm, currentVisitor, nearbyVisitors: people });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -742,11 +703,14 @@ router.put('/update-location', async (req, res) => {
       return res.json({ success: true, skipped: true });
     }
 
-    visitor.latitude = latitude;
-    visitor.longitude = longitude;
-    // A silent refresh without a fresh place name keeps the last known one.
-    visitor.locationName = locationName || (onlyIfSharing ? visitor.locationName : '') || '';
-    visitor.locationAccuracy = accuracy || null;
+    const lat = Number(latitude), lng = Number(longitude);
+    if (!validCoords(lat, lng)) return res.status(400).json({ message: 'लोकेशन सही नहीं है' });
+    visitor.latitude = lat;
+    visitor.longitude = lng;
+    visitor.geo = { type: 'Point', coordinates: [lng, lat] };
+    // No fresh place name (lookup failed or skipped): keep the last one.
+    visitor.locationName = String(locationName || visitor.locationName || '').slice(0, 120);
+    visitor.locationAccuracy = Number.isFinite(Number(accuracy)) ? Math.round(Number(accuracy)) : null;
     visitor.locationUpdatedAt = new Date();
     visitor.locationDenied = false;
     visitor.nearbySharingEnabled = true;
