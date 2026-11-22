@@ -43,6 +43,11 @@ const visitorSchema = new mongoose.Schema({
   locationUpdatedAt: { type: Date },
   locationDenied: { type: Boolean, default: false },
   nearbySharingEnabled: { type: Boolean, default: false },
+  // Same point as latitude/longitude in GeoJSON, for the 2dsphere "people near me" query.
+  geo: {
+    type: { type: String, enum: ['Point'], default: undefined },
+    coordinates: { type: [Number], default: undefined }, // [longitude, latitude]
+  },
   visitCount: { type: Number, default: 1 },
   totalTimeOnSite: { type: Number, default: 0 }, // ms
   lastVisit: { type: Date, default: Date.now },
@@ -76,5 +81,9 @@ const visitorSchema = new mongoose.Schema({
   // Linked Android app device (matched by shared IP)
   linkedAndroidDeviceId: { type: mongoose.Schema.Types.ObjectId, ref: 'AndroidDevice', default: null }
 }, { timestamps: true });
+
+// Nearby: nearest opted-in people first (docs without `geo` are skipped by 2dsphere).
+visitorSchema.index({ geo: '2dsphere' });
+visitorSchema.index({ nearbySharingEnabled: 1, locationUpdatedAt: -1 });
 
 module.exports = mongoose.models.Visitor || mongoose.model('Visitor', visitorSchema);
